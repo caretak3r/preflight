@@ -10,15 +10,24 @@ NC='\033[0m' # No Color
 declare -a TESTS
 
 # Configuration - Add any missing tools here
-REQUIRED_TOOLS=("kubectl" "jq" "helm")
+REQUIRED_TOOLS=("kubectl" "jq" "helm" "curl")
 
 # Configuration
-MIN_K8S_VERSION="1.24"
+MIN_K8S_VERSION="1.2"
 SUPPORTED_DISTROS=("aks" "eks")
 REQUIRED_ENDPOINTS=(
   "https://kubernetes.default.svc"
   "https://registry-1.docker.io"
   "https://quay.io"
+)
+
+# EC2 instance types that meet minimum requirements
+# Format: instance_type:min_cpu:min_memory_gb
+MINIMUM_EC2_INSTANCES=(
+  "t3.xlarge:4:16"
+  "m5.large:2:8"
+  "c5.large:2:4"
+  "r5.large:2:16"
 )
 
 # Output formatting
@@ -234,6 +243,60 @@ check_node_resources() {
     fi
 }
 
+check_nodes_with_taints() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "FAIL|kubectl not found"
+        return
+    fi
+    
+    local nodes_with_taints=$(kubectl get nodes -o json | jq '[.items[] | select(.spec.taints != null and .spec.taints | length > 0)] | length')
+    
+    if [ "$nodes_with_taints" -ge 1 ]; then
+        echo "PASS|Found $nodes_with_taints node(s) with taints"
+    else
+        echo "WARN|No nodes with taints found - tokenization may not work properly"
+    fi
+}
+
+check_aws_instance_types() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "FAIL|kubectl not found"
+        return
+    }
+    
+    # Check if we're running on EKS
+    if ! kubectl get nodes -o yaml | grep -q 'eks.amazonaws.com/nodegroup'; then
+        echo "INFO|Not running on EKS, skipping EC2 instance check"
+        return
+    }
+    
+    local inadequate_nodes=()
+    local node_count=0
+    
+    while read -r node_name instance_type; do
+        ((node_count++))
+        local meets_requirements=false
+        
+        for spec in "${MINIMUM_EC2_INSTANCES[@]}"; do
+            IFS=':' read -r acceptable_type min_cpu min_mem <<< "$spec"
+            if [[ "$instance_type" == "$acceptable_type" || "$instance_type" > "$acceptable_type" ]]; then
+                meets_requirements=true
+                break
+            fi
+        done
+        
+        if [ "$meets_requirements" = false ]; then
+            inadequate_nodes+=("$node_name ($instance_type)")
+        fi
+    done < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.beta\.kubernetes\.io/instance-type}{"\n"}{end}')
+    
+    if [ ${#inadequate_nodes[@]} -eq 0 ]; then
+        echo "PASS|All $node_count EC2 instances meet minimum specifications"
+    else
+        echo "FAIL|Found ${#inadequate_nodes[@]} nodes with inadequate EC2 instance types: ${inadequate_nodes[*]}"
+    fi
+}
+
 check_endpoint_reachability() {
     local failed=()
     
@@ -276,6 +339,38 @@ check_helm_releases() {
     echo "PASS|Displayed $count helm releases"
 }
 
+check_helm_repo_access() {
+    if ! command -v helm &> /dev/null; then
+        echo "FAIL|helm not found"
+        return
+    }
+    
+    # Add repo temporarily
+    if ! helm repo add test-repo "$TEST_HELM_REPO" >/dev/null 2>&1; then
+        echo "FAIL|Unable to add helm repository: $TEST_HELM_REPO"
+        return
+    fi
+    
+    # Update repo
+    if ! helm repo update >/dev/null 2>&1; then
+        helm repo remove test-repo >/dev/null 2>&1
+        echo "FAIL|Unable to update helm repository"
+        return
+    }
+    
+    # Try to fetch chart info
+    if ! helm search repo test-repo/$TEST_HELM_CHART >/dev/null 2>&1; then
+        helm repo remove test-repo >/dev/null 2>&1
+        echo "FAIL|Unable to find chart '$TEST_HELM_CHART' in repository"
+        return
+    }
+    
+    # Clean up
+    helm repo remove test-repo >/dev/null 2>&1
+    
+    echo "PASS|Successfully accessed and searched the helm repository ($TEST_HELM_REPO)"
+}
+
 # --------------------------------------------------
 # Register Tests
 # --------------------------------------------------
@@ -291,8 +386,12 @@ TESTS+=("check_managed_provider")
 TESTS+=("check_supported_distribution")
 TESTS+=("check_node_count")
 TESTS+=("check_node_resources")
+TESTS+=("check_nodes_with_taints")
+TESTS+=("check_aws_instance_types")
 TESTS+=("check_endpoint_reachability")
 TESTS+=("check_helm_releases")
+TESTS+=("check_helm_repo_access")
+
 
 # Run all tests
 run_tests
