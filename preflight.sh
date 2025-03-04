@@ -371,6 +371,57 @@ check_helm_repo_access() {
     echo "PASS|Successfully accessed and searched the helm repository ($TEST_HELM_REPO)"
 }
 
+check_memlock_ulimit() {
+    local qualified_nodes=0
+    local total_nodes=0
+    
+    # Method 1: Check for pre-configured labels/annotations
+    local label_nodes=$(kubectl get nodes -o json | 
+        jq -r '.items[] | select(.metadata.labels.memlock_unlimited == "true" or (.metadata.annotations.memlock // "0" | tonumber >= 3000000)) | .metadata.name' | wc -l)
+    
+    # Method 2: Check kubelet configuration (if accessible)
+    local config_nodes=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' | xargs -n1 -I{} sh -c \
+        'kubectl get --raw /api/v1/nodes/{}/proxy/configz 2>/dev/null | grep -q "memlock=unlimited" && echo {}' | wc -l)
+
+    # Combine results
+    qualified_nodes=$((label_nodes + config_nodes))
+    total_nodes=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
+
+    if [ "$qualified_nodes" -ge 1 ]; then
+        echo "PASS|Found $qualified_nodes node(s) with memlock ≥3GB/unlimited (via labels/config)"
+    else
+        echo "WARN|Memlock status unknown - requires manual verification (nodes: $total_nodes)"
+        echo "      Check either:"
+        echo "      a) Node labels/annotations: memlock_unlimited=true or memlock≥3000000"
+        echo "      b) Kubelet config: --memory-lock=true or equivalent"
+    fi
+}
+
+check_chicken_taint() {
+    if ! command -v kubectl &>/dev/null; then
+        echo "FAIL|kubectl not found"
+        return 1
+    fi
+
+    local target_taint="chicken.com/tier=chicken:NoExecute"
+    local tainted_nodes=$(kubectl get nodes -o json | \
+        jq -r --arg taint "$target_taint" '
+        .items[] | 
+        select(.spec.taints != null) |
+        .metadata.name as $name |
+        .spec.taints[] | 
+        select(.key == "c1s.com/tier" and 
+               .value == "chicken" and 
+               .effect == "NoExecute") |
+        $name' | uniq | wc -l)
+
+    if [ "$tainted_nodes" -ge 1 ]; then
+        echo "PASS|Found $tainted_nodes node(s) with required taint: $target_taint"
+    else
+        echo "FAIL|No nodes found with required taint: $target_taint"
+    fi
+}
+
 # --------------------------------------------------
 # Register Tests
 # --------------------------------------------------
@@ -391,6 +442,8 @@ TESTS+=("check_aws_instance_types")
 TESTS+=("check_endpoint_reachability")
 TESTS+=("check_helm_releases")
 TESTS+=("check_helm_repo_access")
+TESTS+=("check_memlock_ulimit")
+TESTS+=("check_chicken_taint")
 
 
 # Run all tests
