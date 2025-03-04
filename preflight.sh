@@ -456,10 +456,70 @@ check_replicated_chart_pull() {
         echo "FAIL|Failed to pull chart. Error: $(grep -i error "$output_log" | head -n1 | cut -c1-80)"
     fi
 
+    # In check_replicated_chart_pull():
+    if [ $success -eq 1 ]; then
+      echo "PASS|Successfully pulled chart: $chart_url (v$version)"
+      export REPLICATED_CHART_PATH="$tmp_dir/preflight"  # Add this line
+    else
+      rm -rf "$tmp_dir"
+    fi
+}
+
+check_replicated_helm_install() {
+    # Dependency check
+    if ! command -v helm &>/dev/null; then
+        echo "FAIL|helm not found"
+        return 1
+    fi
+
+    # Check if chart was successfully pulled
+    if [[ -z "$REPLICATED_CHART_PATH" || ! -f "$REPLICATED_CHART_PATH/Chart.yaml" ]]; then
+        echo "SKIP|Install skipped - chart not available"
+        return 2
+    fi
+
+    local release_name="preflight-test-$(date +%s)"
+    local tmp_dir=$(mktemp -d)
+    local output_log="$tmp_dir/install.log"
+    local success=0
+
+    # Create test namespace
+    HELM_TEST_NAMESPACE="preflight-system"
+    kubectl create namespace "$HELM_TEST_NAMESPACE" >/dev/null 2>&1
+
+    # Attempt installation with dry-run first
+    (
+        helm install "$release_name" "$REPLICATED_CHART_PATH" \
+            -n "$HELM_TEST_NAMESPACE" \
+            --dry-run \
+            --debug >"$output_log" 2>&1
+    )
+
+    # Validate dry-run success
+    if [ $? -eq 0 ]; then
+        # Perform actual installation
+        if helm install "$release_name" "$REPLICATED_CHART_PATH" \
+            -n "$HELM_TEST_NAMESPACE" \
+            --atomic \
+            --timeout 5m >"$output_log" 2>&1; then
+            echo "PASS|Successfully installed chart: $REPLICATED_CHART_PATH"
+            success=1
+        else
+            echo "FAIL|Install failed. Error: $(grep -i error "$output_log" | tail -n1 | cut -c1-80)"
+        fi
+    else
+        echo "FAIL|Dry-run failed. Error: $(grep -i error "$output_log" | tail -n1 | cut -c1-80)"
+    fi
+
     # Cleanup
-    rm -rf "$tmp_dir"
+    helm uninstall "$release_name" -n "$HELM_TEST_NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    kubectl delete namespace "$HELM_TEST_NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    rm -rf "$tmp_dir" "$REPLICATED_CHART_PATH"
+    unset REPLICATED_CHART_PATH
+
     return $((1 - success))
 }
+
 
 # --------------------------------------------------
 # Register Tests
@@ -484,6 +544,7 @@ TESTS+=("check_helm_repo_access")
 TESTS+=("check_memlock_ulimit")
 TESTS+=("check_chicken_taint")
 TESTS+=("check_replicated_chart_pull")
+TESTS+=("check_replicated_helm_install")
 
 # Run all tests
 run_tests
