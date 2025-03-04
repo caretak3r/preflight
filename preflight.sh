@@ -422,6 +422,45 @@ check_chicken_taint() {
     fi
 }
 
+check_replicated_chart_pull() {
+    if ! command -v helm &>/dev/null; then
+        echo "FAIL|helm not found"
+        return 1
+    fi
+
+    local chart_url="oci://registry.replicated.com/preflight"
+    local version="0.1.5"
+    local tmp_dir=$(mktemp -d)
+    local output_log="$tmp_dir/pull.log"
+    local success=0
+
+    # Check Helm version for OCI support
+    local helm_version=$(helm version --short | cut -d. -f1-3 | tr -d 'v')
+    if [[ $(printf "%s\n" "3.8.0" "$helm_version" | sort -V | head -n1) != "3.8.0" ]]; then
+        echo "FAIL|Helm 3.8.0+ required for OCI support (found $helm_version)"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # Attempt chart pull with cleanup
+    (
+        cd "$tmp_dir"
+        helm pull "$chart_url" --version "$version" --untar >"$output_log" 2>&1
+    )
+    
+    # Verify results
+    if [ $? -eq 0 ] && [ -d "$tmp_dir/preflight" ] && [ -f "$tmp_dir/preflight/Chart.yaml" ]; then
+        echo "PASS|Successfully pulled chart: $chart_url (v$version)"
+        success=1
+    else
+        echo "FAIL|Failed to pull chart. Error: $(grep -i error "$output_log" | head -n1 | cut -c1-80)"
+    fi
+
+    # Cleanup
+    rm -rf "$tmp_dir"
+    return $((1 - success))
+}
+
 # --------------------------------------------------
 # Register Tests
 # --------------------------------------------------
@@ -444,7 +483,7 @@ TESTS+=("check_helm_releases")
 TESTS+=("check_helm_repo_access")
 TESTS+=("check_memlock_ulimit")
 TESTS+=("check_chicken_taint")
-
+TESTS+=("check_replicated_chart_pull")
 
 # Run all tests
 run_tests
