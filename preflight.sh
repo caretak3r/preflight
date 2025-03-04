@@ -13,13 +13,28 @@ declare -a TESTS
 REQUIRED_TOOLS=("kubectl" "jq" "helm" "curl")
 
 # Configuration
-MIN_K8S_VERSION="1.2"
+MIN_K8S_VERSION="1.3"
 SUPPORTED_DISTROS=("aks" "eks")
 REQUIRED_ENDPOINTS=(
   "https://kubernetes.default.svc"
   "https://registry-1.docker.io"
   "https://quay.io"
 )
+
+# Configuration - Minimum versions
+declare -A MIN_VERSIONS=(
+    ["kubectl"]="1.20.0"
+    ["helm"]="3.8.0"
+    ["jq"]="1.6"
+    ["curl"]="7.64.0"
+)
+
+version_meets_min() {
+    local version=$1
+    local min_version=$2
+    printf '%s\n%s' "$version" "$min_version" | 
+    sort -V -C -t '.' -k1,1 -k2,2 -k3,3
+}
 
 # EC2 instance types that meet minimum requirements
 # Format: instance_type:min_cpu:min_memory_gb
@@ -76,19 +91,83 @@ run_tests() {
 # --------------------------------------------------
 # Built-in Test Functions
 # --------------------------------------------------
+# check_dependencies() {
+#     local missing=()
+#     for tool in "${REQUIRED_TOOLS[@]}"; do
+#         if ! command -v "$tool" &> /dev/null; then
+#             missing+=("$tool")
+#         fi
+#     done
+
+#     if [ ${#missing[@]} -eq 0 ]; then
+#         echo "PASS|All required tools are installed"
+#     else
+#         echo "FAIL|Missing required tools: ${missing[*]}"
+#     fi
+# }
+
 check_dependencies() {
-    local missing=()
-    for tool in "${REQUIRED_TOOLS[@]}"; do
+    local missing_tools=()
+    local outdated_tools=()
+    local status="PASS"
+    local message="All dependencies met"
+
+    for tool in "${!MIN_VERSIONS[@]}"; do
+        local min_ver="${MIN_VERSIONS[$tool]}"
+        
+        # Check if tool exists
         if ! command -v "$tool" &> /dev/null; then
-            missing+=("$tool")
+            missing_tools+=("$tool")
+            continue
+        fi
+
+        # Get installed version
+        local installed_ver=""
+        case "$tool" in
+            kubectl)
+                installed_ver=$(kubectl version --client --short 2>&1 | 
+                    grep -oP 'v?\K\d+\.\d+\.\d+')
+                ;;
+            helm)
+                installed_ver=$(helm version --short | 
+                    cut -d '+' -f1 | 
+                    grep -oP 'v?\K\d+\.\d+\.\d+')
+                ;;
+            jq)
+                installed_ver=$(jq --version 2>&1 | 
+                    grep -oP 'jq-\K\d+\.\d+')
+                ;;
+            curl)
+                installed_ver=$(curl --version | 
+                    head -n1 | 
+                    grep -oP 'curl \K\d+\.\d+\.\d+')
+                ;;
+        esac
+
+        # Validate version format
+        if [[ ! "$installed_ver" =~ ^[0-9]+\.[0-9]+\.?[0-9]*$ ]]; then
+            outdated_tools+=("$tool (version detection failed)")
+            continue
+        fi
+
+        # Compare versions
+        if ! version_meets_min "$installed_ver" "$min_ver"; then
+            outdated_tools+=("$tool (installed: $installed_ver < required: $min_ver)")
         fi
     done
 
-    if [ ${#missing[@]} -eq 0 ]; then
-        echo "PASS|All required tools are installed"
-    else
-        echo "FAIL|Missing required tools: ${missing[*]}"
+    # Build result message
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        status="FAIL"
+        message="Missing tools: ${missing_tools[*]}"
     fi
+
+    if [ ${#outdated_tools[@]} -gt 0 ]; then
+        status="FAIL"
+        message+=" | Outdated tools: ${outdated_tools[*]}"
+    fi
+
+    echo "${status}|${message}"
 }
 
 check_cpu_cores() {
